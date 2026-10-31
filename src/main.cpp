@@ -1,5 +1,6 @@
 // Munizioni nell'HUD: scrive il tipo di munizioni dell'arma impugnata accanto al contatore dei colpi
-// (in basso a destra), nel colore e nel carattere dell'HUD del gioco.
+// (in basso a destra), nel colore e nel carattere dell'HUD del gioco; e il nome della granata o mina
+// equipaggiata accanto al contatore delle granate.
 //
 // Il campo di testo viene aggiunto dentro AmmoCount_mc di HUDMenu.swf, così sparisce insieme al
 // contatore (armi da mischia, menu, Pip-Boy). Ogni 250 ms un compito sul thread dell'interfaccia
@@ -11,23 +12,25 @@ namespace
 {
 	namespace GFx = Scaleform::GFx;
 
-	constexpr auto NOME_CAMPO = "AmmoTypeHUD_tf";
 
 	struct Impostazioni
 	{
 		double dimensione{ 20.0 };  // dimensione del carattere (i numeri del contatore sono 32)
 		double destra{ -56.0 };     // bordo destro del testo, rispetto al contatore
-		double alto{ -11.0 };       // bordo superiore del testo, rispetto al contatore
+		double alto{ 4.0 };         // bordo superiore del testo, rispetto al contatore (riga della riserva)
 		double larghezza{ 320.0 };
 		// parole tolte all'inizio o alla fine del nome: "Munizioni 10mm" -> "10mm", ".50 Caliber" -> ".50"
 		std::vector<std::string> togli{ "Munizioni ", "Calibro ", " Round", " Caliber" };
+		// nome e numero della granata o mina equipaggiata, sulla riga sopra le munizioni
+		bool   granata{ true };
+		double granataDestra{ -56.0 };
+		double granataAlto{ -33.0 };  // riga del caricatore
 	};
 
 	Impostazioni           impostazioni;
 	std::filesystem::path  fileIni;
 	std::filesystem::file_time_type dataIni{};
 	std::atomic_bool       partitaCaricata{ false };
-	std::string            ultimoTesto;
 	bool                   ricreaCampo{ false };
 
 	double LeggiNumero(const wchar_t* a_chiave, double a_predefinito)
@@ -84,6 +87,9 @@ namespace
 		impostazioni.alto = LeggiNumero(L"Top", base.alto);
 		impostazioni.larghezza = LeggiNumero(L"Width", base.larghezza);
 		impostazioni.togli = LeggiElenco(L"Strip", base.togli);
+		impostazioni.granata = LeggiNumero(L"Grenade", 1.0) != 0.0;
+		impostazioni.granataDestra = LeggiNumero(L"GrenadeRight", base.granataDestra);
+		impostazioni.granataAlto = LeggiNumero(L"GrenadeTop", base.granataAlto);
 		ricreaCampo = true;
 		REX::INFO("Settings: size {}, right {}, top {}", impostazioni.dimensione, impostazioni.destra, impostazioni.alto);
 	}
@@ -103,19 +109,10 @@ namespace
 		return utf8;
 	}
 
-	std::string NomeMunizioni()
+	// Nome da mostrare: senza etichette dei riordinatori e senza le parole dell'elenco Strip
+	std::string NomeBreve(const RE::TESForm& a_oggetto)
 	{
-		const auto giocatore = RE::PlayerCharacter::GetSingleton();
-		if (!giocatore) {
-			return {};
-		}
-		RE::BGSEquipIndex indice;
-		indice.index = 0;
-		const auto munizioni = giocatore->GetCurrentAmmo(indice);
-		if (!munizioni) {
-			return {};
-		}
-		const auto nome = RE::TESFullName::GetFullName(*munizioni);
+		const auto nome = RE::TESFullName::GetFullName(a_oggetto);
 		if (nome.empty()) {
 			return {};
 		}
@@ -139,7 +136,118 @@ namespace
 		return testo;
 	}
 
-	// Sul thread dell'interfaccia: crea il campo se manca (HUD appena caricato) e aggiorna il testo.
+	std::string NomeMunizioni()
+	{
+		const auto giocatore = RE::PlayerCharacter::GetSingleton();
+		if (!giocatore) {
+			return {};
+		}
+		RE::BGSEquipIndex indice;
+		indice.index = 0;
+		const auto munizioni = giocatore->GetCurrentAmmo(indice);
+		return munizioni ? NomeBreve(*munizioni) : std::string{};
+	}
+
+	// Granata o mina equipaggiata e quante se ne hanno, per esempio "Molotov 2": nell'inventario,
+	// l'arma da lancio con una pila equipaggiata (il gioco non la tiene tra le armi in mano)
+	std::string NomeGranata()
+	{
+		const auto giocatore = RE::PlayerCharacter::GetSingleton();
+		if (!giocatore || !giocatore->inventoryList) {
+			return {};
+		}
+		auto& inventario = *giocatore->inventoryList;
+		RE::BSAutoReadLock blocco{ inventario.rwLock };
+		for (const auto& voce : inventario.data) {
+			const auto arma = voce.object ? voce.object->As<RE::TESObjectWEAP>() : nullptr;
+			// Il tipo è un valore, non un insieme di bit: IsThrownWeapon() di CommonLibF4 lo confronta
+			// come maschera e scambia anche le pistole (9) per granate (10) e mine (11).
+			const auto tipo = arma ? arma->weaponData.type.get() : RE::WEAPON_TYPE::kHandToHand;
+			if (tipo != RE::WEAPON_TYPE::kGrenade && tipo != RE::WEAPON_TYPE::kMine) {
+				continue;
+			}
+			bool equipaggiata = false;
+			std::uint32_t quante = 0;
+			for (auto pila = voce.stackData.get(); pila; pila = pila->nextStack.get()) {
+				equipaggiata = equipaggiata || pila->IsEquipped();
+				quante += pila->GetCount();
+			}
+			if (equipaggiata) {
+				const auto nome = NomeBreve(*arma);
+				return nome.empty() ? nome : std::format("{} {}", nome, quante);
+			}
+		}
+		return {};
+	}
+
+	// Un campo di testo aggiunto a un contatore dell'HUD, accanto ai suoi numeri
+	struct Campo
+	{
+		const char* nome;          // nome della proprietà nel contatore
+		const char* contatore;     // contatore dentro RightMeters_mc
+		const char* modello;       // campo di testo del contatore di cui copiare il carattere
+		std::string ultimoTesto;
+	};
+
+	Campo campoMunizioni{ "AmmoTypeHUD_tf", "AmmoCount_mc", "ReserveCount_tf", {} };
+	// la granata sta nel contatore dei colpi, sulla riga del caricatore: il contatore delle granate del
+	// gioco compare solo per pochi secondi quando si cambia arma
+	Campo campoGranata{ "AmmoTypeHUD_grenade_tf", "AmmoCount_mc", "ClipCount_tf", {} };
+
+	// Crea il campo se manca (HUD appena caricato) o se sono cambiate le impostazioni, poi aggiorna il testo
+	void AggiornaCampo(GFx::Movie& a_film, GFx::Value& a_destro, Campo& a_campo, bool a_ricrea, bool a_attivo,
+		double a_destra, double a_alto, const std::string& a_testo)
+	{
+		GFx::Value contatore, modello, campo;
+		if (!a_destro.GetMember(a_campo.contatore, &contatore) || !contatore.IsDisplayObject()) {
+			return;
+		}
+		const bool esiste = contatore.GetMember(a_campo.nome, &campo) && campo.IsDisplayObject();
+		if (esiste && (a_ricrea || !a_attivo)) {
+			contatore.Invoke("removeChild", nullptr, &campo, 1);
+			contatore.SetMember(a_campo.nome, GFx::Value());
+		}
+		if (!a_attivo) {
+			return;
+		}
+		if (!esiste || a_ricrea) {
+			if (!contatore.GetMember(a_campo.modello, &modello) || !modello.IsDisplayObject()) {
+				return;
+			}
+			a_film.CreateObject(&campo, "flash.text.TextField");
+			if (!campo.IsDisplayObject()) {
+				REX::WARN("Could not create the text field {}", a_campo.nome);
+				return;
+			}
+			// Stesso carattere del contatore (incorporato nel file dell'HUD), più piccolo e allineato a destra
+			GFx::Value formato, incorporato;
+			modello.Invoke("getTextFormat", &formato);
+			if (formato.IsObject()) {
+				formato.SetMember("size", GFx::Value(impostazioni.dimensione));
+				formato.SetMember("align", GFx::Value("right"));
+				campo.SetMember("defaultTextFormat", formato);
+			}
+			modello.GetMember("embedFonts", &incorporato);
+			campo.SetMember("embedFonts", incorporato);
+			campo.SetMember("selectable", GFx::Value(false));
+			campo.SetMember("mouseEnabled", GFx::Value(false));
+			campo.SetMember("width", GFx::Value(impostazioni.larghezza));
+			campo.SetMember("height", GFx::Value(impostazioni.dimensione * 1.6));
+			campo.SetMember("x", GFx::Value(a_destra - impostazioni.larghezza));
+			campo.SetMember("y", GFx::Value(a_alto));
+			contatore.Invoke("addChild", nullptr, &campo, 1);
+			contatore.SetMember(a_campo.nome, campo);
+			a_campo.ultimoTesto.clear();
+			campo.SetMember("text", GFx::Value(""));
+			REX::INFO("Field {} added to the HUD", a_campo.nome);
+		}
+		if (a_testo != a_campo.ultimoTesto) {
+			a_campo.ultimoTesto = a_testo;
+			campo.SetMember("text", GFx::Value(a_campo.ultimoTesto.c_str()));
+		}
+	}
+
+	// Sul thread dell'interfaccia
 	void AggiornaHUD()
 	{
 		const auto ui = RE::UI::GetSingleton();
@@ -150,55 +258,16 @@ namespace
 		if (!menu || !menu->uiMovie || !menu->menuObj.IsObject()) {
 			return;
 		}
-
-		GFx::Value destro, contatore, riserva, campo;
-		if (!menu->menuObj.GetMember("RightMeters_mc", &destro) || !destro.IsDisplayObject() ||
-			!destro.GetMember("AmmoCount_mc", &contatore) || !contatore.IsDisplayObject()) {
+		GFx::Value destro;
+		if (!menu->menuObj.GetMember("RightMeters_mc", &destro) || !destro.IsDisplayObject()) {
 			return;
 		}
-
-		const bool esiste = contatore.GetMember(NOME_CAMPO, &campo) && campo.IsDisplayObject();
-		if (esiste && ricreaCampo) {
-			contatore.Invoke("removeChild", nullptr, &campo, 1);
-		}
-		if (!esiste || ricreaCampo) {
-			ricreaCampo = false;
-			if (!contatore.GetMember("ReserveCount_tf", &riserva) || !riserva.IsDisplayObject()) {
-				return;
-			}
-			menu->uiMovie->CreateObject(&campo, "flash.text.TextField");
-			if (!campo.IsDisplayObject()) {
-				REX::WARN("Could not create the text field");
-				return;
-			}
-			// Stesso carattere del contatore (incorporato nel file dell'HUD), più piccolo e allineato a destra
-			GFx::Value formato, incorporato;
-			riserva.Invoke("getTextFormat", &formato);
-			if (formato.IsObject()) {
-				formato.SetMember("size", GFx::Value(impostazioni.dimensione));
-				formato.SetMember("align", GFx::Value("right"));
-				campo.SetMember("defaultTextFormat", formato);
-			}
-			riserva.GetMember("embedFonts", &incorporato);
-			campo.SetMember("embedFonts", incorporato);
-			campo.SetMember("selectable", GFx::Value(false));
-			campo.SetMember("mouseEnabled", GFx::Value(false));
-			campo.SetMember("width", GFx::Value(impostazioni.larghezza));
-			campo.SetMember("height", GFx::Value(impostazioni.dimensione * 1.6));
-			campo.SetMember("x", GFx::Value(impostazioni.destra - impostazioni.larghezza));
-			campo.SetMember("y", GFx::Value(impostazioni.alto));
-			contatore.Invoke("addChild", nullptr, &campo, 1);
-			contatore.SetMember(NOME_CAMPO, campo);
-			ultimoTesto.clear();
-			campo.SetMember("text", GFx::Value(""));
-			REX::INFO("Ammo type field added to the HUD");
-		}
-
-		const auto testo = NomeMunizioni();
-		if (testo != ultimoTesto) {
-			ultimoTesto = testo;
-			campo.SetMember("text", GFx::Value(ultimoTesto.c_str()));
-		}
+		const bool ricrea = ricreaCampo;
+		ricreaCampo = false;
+		AggiornaCampo(*menu->uiMovie, destro, campoMunizioni, ricrea, true,
+			impostazioni.destra, impostazioni.alto, NomeMunizioni());
+		AggiornaCampo(*menu->uiMovie, destro, campoGranata, ricrea, impostazioni.granata,
+			impostazioni.granataDestra, impostazioni.granataAlto, impostazioni.granata ? NomeGranata() : std::string{});
 	}
 
 	void Controllo(std::stop_token a_stop)

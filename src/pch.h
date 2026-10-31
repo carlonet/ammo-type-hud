@@ -8,6 +8,7 @@
 #include <atomic>
 #include <filesystem>
 #include <string>
+#include <format>
 #include <thread>
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
