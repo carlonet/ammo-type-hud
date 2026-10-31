@@ -1,6 +1,6 @@
 # Ammo Type on HUD
 
-F4SE plugin for **Fallout 4 1.11.240** that shows the ammo type of the equipped weapon next to the vanilla
+[Nexus Mods page](https://www.nexusmods.com/fallout4/mods/110793) · F4SE plugin for **Fallout 4 1.11.240** that shows the ammo type of the equipped weapon next to the vanilla
 HUD ammo counter, in the HUD's own font and colour. No ESP/ESL, nothing stored in saves.
 
 ![Ammo type next to the counter](rilascio/immagine-2-dettaglio.png)
